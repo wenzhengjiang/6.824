@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 //
@@ -17,7 +18,8 @@ import (
 //
 func mapF(filename string, contents string) []mapreduce.KeyValue {
 	var pairs []mapreduce.KeyValue
-	for _, w := range strings.Fields(contents) {
+	isWordSplit := func(c rune) bool { return !unicode.IsLetter(c) }
+	for _, w := range strings.FieldsFunc(contents, isWordSplit) {
 		pairs = append(pairs, mapreduce.KeyValue{Key: w, Value: "1"})
 	}
 	return pairs
