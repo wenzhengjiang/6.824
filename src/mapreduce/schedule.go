@@ -42,25 +42,40 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 			}
 		}
 	}()
+
+	taskChan := make(chan int, ntasks)
+	go func() {
+		for i := 0; i < ntasks; i++ {
+			taskChan <- i
+		}
+	}()
+
 	var wg sync.WaitGroup
 	wg.Add(ntasks)
-	for i := 0; i < ntasks; i++ {
-		args := DoTaskArgs{
-			JobName:       jobName,
-			Phase:         phase,
-			TaskNumber:    i,
-			NumOtherPhase: n_other,
+	go func() {
+		for taskNumber := range taskChan {
+			args := DoTaskArgs{
+				JobName:       jobName,
+				Phase:         phase,
+				TaskNumber:    taskNumber,
+				NumOtherPhase: n_other,
+			}
+			if phase == mapPhase {
+				args.File = mapFiles[taskNumber]
+			}
+			go func(args DoTaskArgs) {
+				worker := <-workerChan
+				if call(worker, "Worker.DoTask", &args, nil) {
+					workerChan <- worker
+					wg.Done()
+				} else {
+					// Deal with worker failure
+					taskChan <- args.TaskNumber
+				}
+			}(args)
 		}
-		if phase == mapPhase {
-			args.File = mapFiles[i]
-		}
-		go func(args DoTaskArgs) {
-			worker := <-workerChan
-			call(worker, "Worker.DoTask", &args, nil)
-			workerChan <- worker
-			wg.Done()
-		}(args)
-	}
+	}()
+
 	wg.Wait()
 
 	fmt.Printf("Schedule: %v phase done\n", phase)
