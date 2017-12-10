@@ -6,7 +6,7 @@ import (
 )
 
 // Debugging enabled?
-const debugEnabled = false
+const debugEnabled = true
 
 // debug() will only print if debugEnabled is true
 func debug(format string, a ...interface{}) (n int, err error) {
@@ -40,4 +40,10 @@ func reduceName(jobName string, mapTask int, reduceTask int) string {
 // mergeName constructs the name of the output file of reduce task <reduceTask>
 func mergeName(jobName string, reduceTask int) string {
 	return "mrtmp." + jobName + "-res-" + strconv.Itoa(reduceTask)
+}
+
+func checkErr(e error) {
+	if e != nil {
+		panic(e)
+	}
 }
