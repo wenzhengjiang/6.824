@@ -23,8 +23,6 @@ import "labrpc"
 // import "bytes"
 // import "encoding/gob"
 
-
-
 //
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -49,16 +47,17 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-
+	currentTerm int
+	votedFor    int
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
-	var term int
-	var isleader bool
-	// Your code here (2A).
+	var term int = rf.currentTerm
+	var isleader bool = rf.votedFor == me
+
 	return term, isleader
 }
 
@@ -93,15 +92,14 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
-
-
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term        int
+	CandidateId int
 }
 
 //
@@ -110,16 +108,56 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
 }
 
 //
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
+	if args.Term < rf.currentTerm {
+		reply.VoteGranted = false
+	} else if args.Term > rf.currentTerm {
+		reply.VoteGranted = true
+		rf.votedFor = args.CandidateId
+		rf.currentTerm = args.Term
+	} else {
+		// Only vote once in the same term
+		reply.VoteGranted = rf.votedFor == nil || rf.votedFor == args.CandidateId
+	}
+	reply.Term = rf.currentTerm
 }
 
 //
+// example Appendentries RPC arguments structure.
+// field names must start with capital letters!
+//
+type AppendEntrieseArgs struct {
+	// Your data here (2A, 2B).
+	Term     int
+	LeaderId int
+}
+
+//
+// example AppendEntries RPC reply structure.
+// field names must start with capital letters!
+//
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+	} else if args.Term > rf.currentTerm {
+		reply.Success = true
+		rf.Term = args.Term
+	}
+	reply.Term = rf.currentTerm
+}
+
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
 // expects RPC arguments in args.
@@ -153,7 +191,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -173,7 +210,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -207,10 +243,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	go func() {
+
+	}()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
 
 	return rf
 }
