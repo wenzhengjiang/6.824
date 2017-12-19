@@ -17,8 +17,12 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "labrpc"
+import (
+	"labrpc"
+	"math/rand"
+	"sync"
+	"time"
+)
 
 // import "bytes"
 // import "encoding/gob"
@@ -49,6 +53,11 @@ type Raft struct {
 	// state a Raft server must maintain.
 	currentTerm int
 	votedFor    int
+
+	appendEntriesArgChan   chan *AppendEntriesArgs
+	appendEntriesReplyChan chan AppendEntriesReply
+	requestVoteArgChan     chan *RequestVoteArgs
+	requestVoteReplyChan   chan RequestVoteReply
 }
 
 // return currentTerm and whether this server
@@ -116,17 +125,25 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	if args.Term < rf.currentTerm {
-		reply.VoteGranted = false
-	} else if args.Term > rf.currentTerm {
-		reply.VoteGranted = true
-		rf.votedFor = args.CandidateId
-		rf.currentTerm = args.Term
+	rf.requestVoteArgsChan <- args
+	*reply = *<-rf.requestVoteReplyChan
+}
+
+func (rf *Raft) handleRequestVote(args *RequestVoteArgs) RequestVoteReply {
+	var voteGranted bool
+	if args.Term > rf.currentTerm {
+		voteGranted = true
+		rf.votedFor = rf.CandidateId
+	} else if args.Term < rf.currentTerm {
+		voteGranted = false
+	} else if !rf.votedFor || rf.votedFor == args.CandidateId {
+		voteGranted = true
+		rf.votedFor = rf.CandidateId
 	} else {
-		// Only vote once in the same term
-		reply.VoteGranted = rf.votedFor == nil || rf.votedFor == args.CandidateId
+		// Don't vote for two candiate at the same time
+		voteGranted = false
 	}
-	reply.Term = rf.currentTerm
+	return RequestVoteReply{VoteGranted: voteGranted, Term: rf.currentTerm}
 }
 
 //
@@ -149,13 +166,24 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	if args.Term < rf.currentTerm {
-		reply.Success = false
-	} else if args.Term > rf.currentTerm {
-		reply.Success = true
-		rf.Term = args.Term
+	rf.appendEntriesArgsChan <- args
+	*reply = <-rf.appendEntriesReplyChan
+}
+
+func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs) AppendEntriesReply {
+	var success bool
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		success = true
+	} else if args.Term < rf.currentTerm {
+		success = false
+	} else {
+		if rf.votedFor != args.LeaderId {
+			panic("Two leader with the same term is not possible!")
+		}
+		success = true
 	}
-	reply.Term = rf.currentTerm
+	return AppendEntriesReply{Term: rf.currentTerm, Success: success}
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -225,6 +253,74 @@ func (rf *Raft) Kill() {
 }
 
 //
+// Check heartbeat periodically.
+// If not received, increase term and become a candidate
+//
+func (rf *Raft) beFollower() {
+	// 10 heartbeats per second = Expect to receive heartbeat every 100ms, timeout can be 300~500ms ?
+	heartBeatTimeout = (rand.Intn(200) + 300) * time.Millisecond
+	heartBeatTimer = time.NewTimer(heartBeatTimeout)
+	resetTimer := func() {
+		if !heartBeatTimer.Stop() {
+			<-heartBeatTimer.C
+		}
+		heartBeatTimer.Reset(heartBeatTimeout)
+	}
+	for {
+		select {
+		case <-heartBeatTimer.C:
+			// Timeout then become candidate
+			go rf.beCandidate()
+			return
+		case args := <-rf.appendEntriesArgsChan:
+			rf.appendEntriesReplyChan <- rf.handleAppendEntries(args)
+			resetTimer()
+		case args := <-rf.requestVoteArgsChan:
+			rf.requestVoteReplyChan <- rf.handleRequestVote(args)
+			resetTimer()
+		default:
+		}
+	}
+}
+
+//
+// Send vote requests to all peers.
+// * If timeout, start another vote collection
+// * If get `yes` from majority, become leader
+// * If get legit heartbeat, become follower
+//
+func (rf *Raft) beCandidate() {
+	rf.Term += 1
+	rf.votedFor = rf.me
+	selectionTimeout = (rand.Intn(200) + 800) * time.Millisecond
+	selectionTimer := time.NewTimer(selectionTimeout)
+	resetTimer := func() {
+		if !selectionTimer.C.Stop() {
+			<-selectionTimer.C
+		}
+		selectionTimer.C.reset(selectionTimeout)
+	}
+
+	for {
+		// The new leader within five seconds
+		// Hearbeats is sent per 100ms
+		// we choose the election timeout to be 800ms ~ 1s. 5 elections should be enough ?
+		select {
+		case <-selectionTimer.C:
+			// Selection timeout
+			resetTimer()
+		case args := <-rf.appendEntriesArgsChan:
+			reply := handleAppendEntries(args)
+			rf.appendEntriesReplyChan <- reply
+			if reply.Success {
+				go rf.beFollower()
+			}
+		case args := <-rf.requestVoteArgsChan:
+
+		}
+	}
+}
+
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -241,11 +337,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.heartBeatChan = make(chan int)
 
 	// Your initialization code here (2A, 2B, 2C).
-	go func() {
-
-	}()
+	rand.Seed(time.Now().Unix())
+	go rf.beFollower()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
