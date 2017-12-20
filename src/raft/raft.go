@@ -134,6 +134,7 @@ func (rf *Raft) handleRequestVote(args *RequestVoteArgs) RequestVoteReply {
 	if args.Term > rf.currentTerm {
 		voteGranted = true
 		rf.votedFor = rf.CandidateId
+		rf.currentTerm = args.Term
 	} else if args.Term < rf.currentTerm {
 		voteGranted = false
 	} else if !rf.votedFor || rf.votedFor == args.CandidateId {
@@ -219,6 +220,11 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -290,8 +296,6 @@ func (rf *Raft) beFollower() {
 // * If get legit heartbeat, become follower
 //
 func (rf *Raft) beCandidate() {
-	rf.Term += 1
-	rf.votedFor = rf.me
 	selectionTimeout = (rand.Intn(200) + 800) * time.Millisecond
 	selectionTimer := time.NewTimer(selectionTimeout)
 	resetTimer := func() {
@@ -301,6 +305,29 @@ func (rf *Raft) beCandidate() {
 		selectionTimer.C.reset(selectionTimeout)
 	}
 
+	rf.votedFor = rf.me
+	grantedVotesChan := make(chan bool)
+	rf.currentTerm += 1
+	runElection = func() {
+		for i, peer := range rf.peers {
+			if i == rf.me {
+				continue
+			}
+			go func(term int, id int) {
+				var reply RequestVoteReply
+				args := RequestVoteArgs{Term: term, CandidateId: id}
+				if !rf.sendRequestVote(peer, &args, &reply) {
+					return
+				}
+				if reply.VoteGranted && rf.currentTerm == reply.Term {
+					grantedVotesChan <- true
+				}
+			}(rf.currentTerm, rf.me)
+		}
+	}
+
+	grantedVotes := 0
+	majority = (len(rf.peers) + 1) / 2
 	for {
 		// The new leader within five seconds
 		// Hearbeats is sent per 100ms
@@ -309,6 +336,8 @@ func (rf *Raft) beCandidate() {
 		case <-selectionTimer.C:
 			// Selection timeout
 			resetTimer()
+			grantedVotes = 0
+			runElection()
 		case args := <-rf.appendEntriesArgsChan:
 			reply := handleAppendEntries(args)
 			rf.appendEntriesReplyChan <- reply
@@ -316,8 +345,25 @@ func (rf *Raft) beCandidate() {
 				go rf.beFollower()
 			}
 		case args := <-rf.requestVoteArgsChan:
-
+			reply := handleRequestVote(args)
+			rf.requestVoteReplyChan <- reply
+			if reply.voteGranted {
+				go rf.beFollower()
+				return
+			}
+		case <-grantedVotesChan:
+			grantedVotes += 1
+			if grantedVotes >= majority {
+				go rf.beLeader()
+				return
+			}
 		}
+	}
+}
+
+func (rf *Raft) beLeader() {
+	for i, peer := range rf.peers {
+		//TODO
 	}
 }
 
