@@ -54,9 +54,10 @@ type Raft struct {
 	currentTerm int
 	votedFor    int
 
-	appendEntriesArgChan   chan *AppendEntriesArgs
+	electionTimer          *time.Timer
+	appendEntriesArgsChan  chan *AppendEntriesArgs
 	appendEntriesReplyChan chan AppendEntriesReply
-	requestVoteArgChan     chan *RequestVoteArgs
+	requestVoteArgsChan    chan *RequestVoteArgs
 	requestVoteReplyChan   chan RequestVoteReply
 }
 
@@ -65,7 +66,7 @@ type Raft struct {
 func (rf *Raft) GetState() (int, bool) {
 
 	var term int = rf.currentTerm
-	var isleader bool = rf.votedFor == me
+	var isleader bool = rf.votedFor == rf.me
 
 	return term, isleader
 }
@@ -126,20 +127,20 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.requestVoteArgsChan <- args
-	*reply = *<-rf.requestVoteReplyChan
+	*reply = <-rf.requestVoteReplyChan
 }
 
 func (rf *Raft) handleRequestVote(args *RequestVoteArgs) RequestVoteReply {
 	var voteGranted bool
 	if args.Term > rf.currentTerm {
 		voteGranted = true
-		rf.votedFor = rf.CandidateId
+		rf.votedFor = args.CandidateId
 		rf.currentTerm = args.Term
 	} else if args.Term < rf.currentTerm {
 		voteGranted = false
-	} else if !rf.votedFor || rf.votedFor == args.CandidateId {
+	} else if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		voteGranted = true
-		rf.votedFor = rf.CandidateId
+		rf.votedFor = args.CandidateId
 	} else {
 		// Don't vote for two candiate at the same time
 		voteGranted = false
@@ -151,7 +152,7 @@ func (rf *Raft) handleRequestVote(args *RequestVoteArgs) RequestVoteReply {
 // example Appendentries RPC arguments structure.
 // field names must start with capital letters!
 //
-type AppendEntrieseArgs struct {
+type AppendEntriesArgs struct {
 	// Your data here (2A, 2B).
 	Term     int
 	LeaderId int
@@ -173,16 +174,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs) AppendEntriesReply {
 	var success bool
-	if args.Term > rf.currentTerm {
+	if args.Term >= rf.currentTerm {
 		rf.currentTerm = args.Term
+		rf.votedFor = args.LeaderId
 		success = true
 	} else if args.Term < rf.currentTerm {
 		success = false
-	} else {
-		if rf.votedFor != args.LeaderId {
-			panic("Two leader with the same term is not possible!")
-		}
-		success = true
 	}
 	return AppendEntriesReply{Term: rf.currentTerm, Success: success}
 }
@@ -258,35 +255,64 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 }
 
+func (rf *Raft) getElectionTimeout() time.Duration {
+	// Should be much larger than 100ms
+	// Like 600 - 750ms ?
+	return (time.Duration(rand.Intn(150) + 600)) * time.Millisecond
+}
+
+func (rf *Raft) resetElectionTimer() {
+	if rf.electionTimer == nil {
+		rf.electionTimer = time.NewTimer(rf.getElectionTimeout())
+		return
+	}
+	if !rf.electionTimer.Stop() {
+		<-rf.electionTimer.C
+	}
+	rf.electionTimer.Reset(rf.getElectionTimeout())
+}
+
 //
 // Check heartbeat periodically.
 // If not received, increase term and become a candidate
 //
-func (rf *Raft) beFollower() {
-	// 10 heartbeats per second = Expect to receive heartbeat every 100ms, timeout can be 300~500ms ?
-	heartBeatTimeout = (rand.Intn(200) + 300) * time.Millisecond
-	heartBeatTimer = time.NewTimer(heartBeatTimeout)
-	resetTimer := func() {
-		if !heartBeatTimer.Stop() {
-			<-heartBeatTimer.C
-		}
-		heartBeatTimer.Reset(heartBeatTimeout)
-	}
+func (rf *Raft) runFollower() {
+	rf.resetElectionTimer()
 	for {
 		select {
-		case <-heartBeatTimer.C:
+		case <-rf.electionTimer.C:
 			// Timeout then become candidate
-			go rf.beCandidate()
+			go rf.runCandidate()
 			return
 		case args := <-rf.appendEntriesArgsChan:
 			rf.appendEntriesReplyChan <- rf.handleAppendEntries(args)
-			resetTimer()
+			rf.resetElectionTimer()
 		case args := <-rf.requestVoteArgsChan:
 			rf.requestVoteReplyChan <- rf.handleRequestVote(args)
-			resetTimer()
+			rf.resetElectionTimer()
 		default:
 		}
 	}
+}
+
+func (rf *Raft) requestVotes() chan bool {
+	voteChan := make(chan bool)
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(term int, id int, peer int) {
+			var reply RequestVoteReply
+			args := RequestVoteArgs{Term: term, CandidateId: id}
+			if !rf.sendRequestVote(peer, &args, &reply) {
+				return
+			}
+			if reply.VoteGranted && rf.currentTerm == reply.Term {
+				voteChan <- true
+			}
+		}(rf.currentTerm, rf.me, i)
+	}
+	return voteChan
 }
 
 //
@@ -295,75 +321,79 @@ func (rf *Raft) beFollower() {
 // * If get `yes` from majority, become leader
 // * If get legit heartbeat, become follower
 //
-func (rf *Raft) beCandidate() {
-	selectionTimeout = (rand.Intn(200) + 800) * time.Millisecond
-	selectionTimer := time.NewTimer(selectionTimeout)
-	resetTimer := func() {
-		if !selectionTimer.C.Stop() {
-			<-selectionTimer.C
-		}
-		selectionTimer.C.reset(selectionTimeout)
-	}
-
-	rf.votedFor = rf.me
-	grantedVotesChan := make(chan bool)
+func (rf *Raft) runCandidate() {
 	rf.currentTerm += 1
-	runElection = func() {
-		for i, peer := range rf.peers {
-			if i == rf.me {
-				continue
-			}
-			go func(term int, id int) {
-				var reply RequestVoteReply
-				args := RequestVoteArgs{Term: term, CandidateId: id}
-				if !rf.sendRequestVote(peer, &args, &reply) {
-					return
-				}
-				if reply.VoteGranted && rf.currentTerm == reply.Term {
-					grantedVotesChan <- true
-				}
-			}(rf.currentTerm, rf.me)
-		}
-	}
+	rf.votedFor = rf.me
+	rf.resetElectionTimer()
+	voteChan := rf.requestVotes()
 
-	grantedVotes := 0
-	majority = (len(rf.peers) + 1) / 2
+	voteCount := 0
+	majority := (len(rf.peers) + 1) / 2
 	for {
 		// The new leader within five seconds
 		// Hearbeats is sent per 100ms
 		// we choose the election timeout to be 800ms ~ 1s. 5 elections should be enough ?
 		select {
-		case <-selectionTimer.C:
+		case <-rf.electionTimer.C:
 			// Selection timeout
-			resetTimer()
-			grantedVotes = 0
-			runElection()
+			voteCount = 0
+			rf.resetElectionTimer()
+			voteChan = rf.requestVotes()
 		case args := <-rf.appendEntriesArgsChan:
-			reply := handleAppendEntries(args)
+			reply := rf.handleAppendEntries(args)
 			rf.appendEntriesReplyChan <- reply
 			if reply.Success {
-				go rf.beFollower()
+				go rf.runFollower()
 			}
 		case args := <-rf.requestVoteArgsChan:
-			reply := handleRequestVote(args)
+			reply := rf.handleRequestVote(args)
 			rf.requestVoteReplyChan <- reply
-			if reply.voteGranted {
-				go rf.beFollower()
+			if reply.VoteGranted {
+				go rf.runFollower()
 				return
 			}
-		case <-grantedVotesChan:
-			grantedVotes += 1
-			if grantedVotes >= majority {
-				go rf.beLeader()
+		case <-voteChan:
+			voteCount += 1
+			if voteCount >= majority {
+				go rf.runLeader()
 				return
 			}
 		}
 	}
 }
 
-func (rf *Raft) beLeader() {
-	for i, peer := range rf.peers {
-		//TODO
+func (rf *Raft) sendHeartBeats() {
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		var reply AppendEntriesReply
+		rf.sendAppendEntries(i, &AppendEntriesArgs{rf.currentTerm, rf.me}, &reply)
+	}
+}
+func (rf *Raft) runLeader() {
+	rf.sendHeartBeats()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	for {
+		select {
+		case <-ticker.C:
+			rf.sendHeartBeats()
+		case args := <-rf.appendEntriesArgsChan:
+			reply := rf.handleAppendEntries(args)
+			rf.appendEntriesReplyChan <- reply
+			if reply.Success {
+				go rf.runFollower()
+				return
+			}
+		case args := <-rf.requestVoteArgsChan:
+			reply := rf.handleRequestVote(args)
+			rf.requestVoteReplyChan <- reply
+			if reply.VoteGranted {
+				go rf.runFollower()
+				return
+			}
+		default:
+		}
 	}
 }
 
@@ -383,11 +413,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	rf.heartBeatChan = make(chan int)
+	rf.votedFor = -1
 
 	// Your initialization code here (2A, 2B, 2C).
 	rand.Seed(time.Now().Unix())
-	go rf.beFollower()
+	go rf.runFollower()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
