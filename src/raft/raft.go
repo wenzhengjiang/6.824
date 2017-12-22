@@ -124,6 +124,7 @@ type RequestVoteReply struct {
 	// Your data here (2A).
 	Term        int
 	VoteGranted bool
+	Peer        int
 }
 
 //
@@ -133,6 +134,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.log("receive requestVote from %d", args.CandidateId)
 	rf.requestVoteArgsChan <- args
 	*reply = <-rf.requestVoteReplyChan
+	rf.log("reply requestVote from %d", args.CandidateId)
 }
 
 func (rf *Raft) handleRequestVote(args *RequestVoteArgs) RequestVoteReply {
@@ -150,7 +152,7 @@ func (rf *Raft) handleRequestVote(args *RequestVoteArgs) RequestVoteReply {
 		// Don't vote for two candiate at the same time
 		voteGranted = false
 	}
-	return RequestVoteReply{VoteGranted: voteGranted, Term: rf.currentTerm}
+	return RequestVoteReply{VoteGranted: voteGranted, Term: rf.currentTerm, Peer: rf.me}
 }
 
 //
@@ -299,8 +301,8 @@ func (rf *Raft) runFollower() {
 	}
 }
 
-func (rf *Raft) requestVotes() chan int {
-	voteChan := make(chan int)
+func (rf *Raft) requestVotes() chan RequestVoteReply {
+	voteChan := make(chan RequestVoteReply)
 
 	for i := range rf.peers {
 		if i == rf.me {
@@ -312,9 +314,7 @@ func (rf *Raft) requestVotes() chan int {
 			if !rf.sendRequestVote(peer, &args, &reply) {
 				return
 			}
-			if reply.VoteGranted && rf.currentTerm == reply.Term {
-				voteChan <- peer
-			}
+			voteChan <- reply
 		}(rf.currentTerm, rf.me, i)
 	}
 	return voteChan
@@ -360,9 +360,17 @@ func (rf *Raft) runCandidate() {
 				go rf.runFollower()
 				return
 			}
-		case peer := <-voteChan:
-			voteCount += 1
-			rf.log("receive vote from %d, %d votes in total", peer, voteCount)
+		case reply := <-voteChan:
+			if reply.Term > rf.currentTerm {
+				rf.currentTerm = reply.Term
+				rf.votedFor = reply.Peer
+				go rf.runFollower()
+				return
+			}
+			if reply.VoteGranted && rf.currentTerm == reply.Term {
+				voteCount += 1
+				rf.log("receive vote from %d, %d votes in total", reply.Peer, voteCount)
+			}
 			if voteCount >= majority {
 				go rf.runLeader()
 				return
@@ -371,14 +379,21 @@ func (rf *Raft) runCandidate() {
 	}
 }
 
-func (rf *Raft) sendHeartBeats() {
+func (rf *Raft) sendHeartBeats() bool {
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
 		var reply AppendEntriesReply
-		rf.sendAppendEntries(i, &AppendEntriesArgs{rf.currentTerm, rf.me}, &reply)
+		if rf.sendAppendEntries(i, &AppendEntriesArgs{rf.currentTerm, rf.me}, &reply) {
+			if reply.Term > rf.currentTerm {
+				rf.currentTerm = reply.Term
+				rf.votedFor = i
+				return false
+			}
+		}
 	}
+	return true
 }
 
 func (rf *Raft) log(format string, a ...interface{}) (n int, err error) {
@@ -396,12 +411,18 @@ func (rf *Raft) log(format string, a ...interface{}) (n int, err error) {
 func (rf *Raft) runLeader() {
 	rf.isLeader = true
 	rf.log("runLeader")
-	rf.sendHeartBeats()
+	if !rf.sendHeartBeats() {
+		go rf.runFollower()
+		return
+	}
 	ticker := time.NewTicker(100 * time.Millisecond)
 	for {
 		select {
 		case <-ticker.C:
-			rf.sendHeartBeats()
+			if !rf.sendHeartBeats() {
+				go rf.runFollower()
+				return
+			}
 		case args := <-rf.appendEntriesArgsChan:
 			reply := rf.handleAppendEntries(args)
 			rf.appendEntriesReplyChan <- reply
