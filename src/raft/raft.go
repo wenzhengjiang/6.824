@@ -345,6 +345,7 @@ func (rf *Raft) runCandidate() {
 			rf.log("Election timeout")
 			voteCount = 0
 			timer = rf.getElectionTimer()
+			rf.currentTerm += 1
 			voteChan = rf.requestVotes()
 		case args := <-rf.appendEntriesArgsChan:
 			reply := rf.handleAppendEntries(args)
