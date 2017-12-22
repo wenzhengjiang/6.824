@@ -18,7 +18,9 @@ package raft
 //
 
 import (
+	"fmt"
 	"labrpc"
+	"log"
 	"math/rand"
 	"sync"
 	"time"
@@ -51,10 +53,10 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	isLeader    bool
 	currentTerm int
 	votedFor    int
 
-	electionTimer          *time.Timer
 	appendEntriesArgsChan  chan *AppendEntriesArgs
 	appendEntriesReplyChan chan AppendEntriesReply
 	requestVoteArgsChan    chan *RequestVoteArgs
@@ -66,7 +68,7 @@ type Raft struct {
 func (rf *Raft) GetState() (int, bool) {
 
 	var term int = rf.currentTerm
-	var isleader bool = rf.votedFor == rf.me
+	var isleader bool = rf.isLeader
 
 	return term, isleader
 }
@@ -126,6 +128,7 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	rf.log("receive requestVote from %d", args.CandidateId)
 	rf.requestVoteArgsChan <- args
 	*reply = <-rf.requestVoteReplyChan
 }
@@ -168,6 +171,7 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.log("receive appendEntries from %d", args.LeaderId)
 	rf.appendEntriesArgsChan <- args
 	*reply = <-rf.appendEntriesReplyChan
 }
@@ -213,11 +217,13 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs) AppendEntriesReply 
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	rf.log("send requestVote to %d", server)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	rf.log("send appendEntriesvote to %d", server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -255,21 +261,8 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 }
 
-func (rf *Raft) getElectionTimeout() time.Duration {
-	// Should be much larger than 100ms
-	// Like 600 - 750ms ?
-	return (time.Duration(rand.Intn(150) + 600)) * time.Millisecond
-}
-
-func (rf *Raft) resetElectionTimer() {
-	if rf.electionTimer == nil {
-		rf.electionTimer = time.NewTimer(rf.getElectionTimeout())
-		return
-	}
-	if !rf.electionTimer.Stop() {
-		<-rf.electionTimer.C
-	}
-	rf.electionTimer.Reset(rf.getElectionTimeout())
+func (rf *Raft) getElectionTimer() *time.Timer {
+	return time.NewTimer((time.Duration(rand.Intn(150) + 600)) * time.Millisecond)
 }
 
 //
@@ -277,26 +270,30 @@ func (rf *Raft) resetElectionTimer() {
 // If not received, increase term and become a candidate
 //
 func (rf *Raft) runFollower() {
-	rf.resetElectionTimer()
+	rf.isLeader = false
+	rf.log("runFollower")
+	timer := rf.getElectionTimer()
 	for {
 		select {
-		case <-rf.electionTimer.C:
+		case <-timer.C:
+			rf.log("Election timeout")
 			// Timeout then become candidate
 			go rf.runCandidate()
 			return
 		case args := <-rf.appendEntriesArgsChan:
 			rf.appendEntriesReplyChan <- rf.handleAppendEntries(args)
-			rf.resetElectionTimer()
+			timer = rf.getElectionTimer()
 		case args := <-rf.requestVoteArgsChan:
 			rf.requestVoteReplyChan <- rf.handleRequestVote(args)
-			rf.resetElectionTimer()
+			timer = rf.getElectionTimer()
 		default:
 		}
 	}
 }
 
-func (rf *Raft) requestVotes() chan bool {
-	voteChan := make(chan bool)
+func (rf *Raft) requestVotes() chan int {
+	voteChan := make(chan int)
+
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
@@ -308,7 +305,7 @@ func (rf *Raft) requestVotes() chan bool {
 				return
 			}
 			if reply.VoteGranted && rf.currentTerm == reply.Term {
-				voteChan <- true
+				voteChan <- peer
 			}
 		}(rf.currentTerm, rf.me, i)
 	}
@@ -322,11 +319,13 @@ func (rf *Raft) requestVotes() chan bool {
 // * If get legit heartbeat, become follower
 //
 func (rf *Raft) runCandidate() {
+	rf.isLeader = false
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
-	rf.resetElectionTimer()
+	rf.log("runCandidate")
 	voteChan := rf.requestVotes()
 
+	timer := rf.getElectionTimer()
 	voteCount := 0
 	majority := (len(rf.peers) + 1) / 2
 	for {
@@ -334,10 +333,10 @@ func (rf *Raft) runCandidate() {
 		// Hearbeats is sent per 100ms
 		// we choose the election timeout to be 800ms ~ 1s. 5 elections should be enough ?
 		select {
-		case <-rf.electionTimer.C:
-			// Selection timeout
+		case <-timer.C:
+			rf.log("Election timeout")
 			voteCount = 0
-			rf.resetElectionTimer()
+			timer = rf.getElectionTimer()
 			voteChan = rf.requestVotes()
 		case args := <-rf.appendEntriesArgsChan:
 			reply := rf.handleAppendEntries(args)
@@ -352,7 +351,8 @@ func (rf *Raft) runCandidate() {
 				go rf.runFollower()
 				return
 			}
-		case <-voteChan:
+		case peer := <-voteChan:
+			rf.log("receive vote from %d", peer)
 			voteCount += 1
 			if voteCount >= majority {
 				go rf.runLeader()
@@ -371,12 +371,28 @@ func (rf *Raft) sendHeartBeats() {
 		rf.sendAppendEntries(i, &AppendEntriesArgs{rf.currentTerm, rf.me}, &reply)
 	}
 }
+
+func (rf *Raft) log(format string, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		state := "follower"
+		if rf.isLeader {
+			state = "leader"
+		} else if rf.votedFor == rf.me {
+			state = "candidate"
+		}
+		log.Printf("[%d][%s][%d]: %s", rf.me, state, rf.currentTerm, fmt.Sprintf(format, a...))
+	}
+	return
+}
 func (rf *Raft) runLeader() {
+	rf.isLeader = true
+	rf.log("runLeader; send heartbeats")
 	rf.sendHeartBeats()
 	ticker := time.NewTicker(100 * time.Millisecond)
 	for {
 		select {
 		case <-ticker.C:
+			rf.log("send heartbeats")
 			rf.sendHeartBeats()
 		case args := <-rf.appendEntriesArgsChan:
 			reply := rf.handleAppendEntries(args)
@@ -414,6 +430,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	rf.votedFor = -1
+	rf.appendEntriesArgsChan = make(chan *AppendEntriesArgs)
+	rf.appendEntriesReplyChan = make(chan AppendEntriesReply)
+	rf.requestVoteArgsChan = make(chan *RequestVoteArgs)
+	rf.requestVoteReplyChan = make(chan RequestVoteReply)
 
 	// Your initialization code here (2A, 2B, 2C).
 	rand.Seed(time.Now().Unix())
