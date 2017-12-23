@@ -133,6 +133,7 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.log("receive requestVote from %d", args.CandidateId)
 	rf.requestVoteArgsChan <- args
+	rf.log("handling requestVote from %d", args.CandidateId)
 	*reply = <-rf.requestVoteReplyChan
 	rf.log("reply requestVote from %d", args.CandidateId)
 }
@@ -172,6 +173,7 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	PeerId  int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -189,7 +191,7 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs) AppendEntriesReply 
 	} else if args.Term < rf.currentTerm {
 		success = false
 	}
-	return AppendEntriesReply{Term: rf.currentTerm, Success: success}
+	return AppendEntriesReply{Term: rf.currentTerm, Success: success, PeerId: rf.me}
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -379,21 +381,20 @@ func (rf *Raft) runCandidate() {
 	}
 }
 
-func (rf *Raft) sendHeartBeats() bool {
+func (rf *Raft) sendHeartBeats() chan AppendEntriesReply {
+	replyChan := make(chan AppendEntriesReply)
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
-		var reply AppendEntriesReply
-		if rf.sendAppendEntries(i, &AppendEntriesArgs{rf.currentTerm, rf.me}, &reply) {
-			if reply.Term > rf.currentTerm {
-				rf.currentTerm = reply.Term
-				rf.votedFor = i
-				return false
+		go func(server int, term int, me int) {
+			var reply AppendEntriesReply
+			if rf.sendAppendEntries(server, &AppendEntriesArgs{term, me}, &reply) {
+				replyChan <- reply
 			}
-		}
+		}(i, rf.currentTerm, rf.me)
 	}
-	return true
+	return replyChan
 }
 
 func (rf *Raft) log(format string, a ...interface{}) (n int, err error) {
@@ -411,18 +412,13 @@ func (rf *Raft) log(format string, a ...interface{}) (n int, err error) {
 func (rf *Raft) runLeader() {
 	rf.isLeader = true
 	rf.log("runLeader")
-	if !rf.sendHeartBeats() {
-		go rf.runFollower()
-		return
-	}
+	replyChan := rf.sendHeartBeats()
+
 	ticker := time.NewTicker(100 * time.Millisecond)
 	for {
 		select {
 		case <-ticker.C:
-			if !rf.sendHeartBeats() {
-				go rf.runFollower()
-				return
-			}
+			replyChan = rf.sendHeartBeats()
 		case args := <-rf.appendEntriesArgsChan:
 			reply := rf.handleAppendEntries(args)
 			rf.appendEntriesReplyChan <- reply
@@ -434,6 +430,13 @@ func (rf *Raft) runLeader() {
 			reply := rf.handleRequestVote(args)
 			rf.requestVoteReplyChan <- reply
 			if reply.VoteGranted {
+				go rf.runFollower()
+				return
+			}
+		case reply := <-replyChan:
+			if reply.Term > rf.currentTerm {
+				rf.currentTerm = reply.Term
+				rf.votedFor = reply.PeerId
 				go rf.runFollower()
 				return
 			}
