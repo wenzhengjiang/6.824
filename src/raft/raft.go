@@ -131,11 +131,11 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	rf.log("receive requestVote from %d", args.CandidateId)
+	rf.p("receive requestVote from %d", args.CandidateId)
 	rf.requestVoteArgsChan <- args
-	rf.log("handling requestVote from %d", args.CandidateId)
+	rf.p("handling requestVote from %d", args.CandidateId)
 	*reply = <-rf.requestVoteReplyChan
-	rf.log("reply requestVote from %d", args.CandidateId)
+	rf.p("reply requestVote from %d", args.CandidateId)
 }
 
 func (rf *Raft) handleRequestVote(args *RequestVoteArgs) RequestVoteReply {
@@ -177,7 +177,7 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.log("receive appendEntries from %d", args.LeaderId)
+	rf.p("receive appendEntries from %d", args.LeaderId)
 	rf.appendEntriesArgsChan <- args
 	*reply = <-rf.appendEntriesReplyChan
 }
@@ -223,19 +223,19 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs) AppendEntriesReply 
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	rf.log("send requestVote to %d", server)
+	rf.p("send requestVote to %d", server)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	if !ok {
-		rf.log("failed to send requestVote to %d", server)
+		rf.p("failed to send requestVote to %d", server)
 	}
 	return ok
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	rf.log("send appendEntries to %d", server)
+	rf.p("send appendEntries to %d", server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	if !ok {
-		rf.log("failed to send appendEntries to %d", server)
+		rf.p("failed to send appendEntries to %d", server)
 	}
 	return ok
 }
@@ -257,8 +257,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
 	isLeader := true
-
-	// Your code here (2B).
 
 	return index, term, isLeader
 }
@@ -283,12 +281,12 @@ func (rf *Raft) getElectionTimer() *time.Timer {
 //
 func (rf *Raft) runFollower() {
 	rf.isLeader = false
-	rf.log("runFollower")
+	rf.p("runFollower")
 	timer := rf.getElectionTimer()
 	for {
 		select {
 		case <-timer.C:
-			rf.log("Election timeout")
+			rf.p("Election timeout")
 			// Timeout then become candidate
 			go rf.runCandidate()
 			return
@@ -298,7 +296,6 @@ func (rf *Raft) runFollower() {
 		case args := <-rf.requestVoteArgsChan:
 			rf.requestVoteReplyChan <- rf.handleRequestVote(args)
 			timer = rf.getElectionTimer()
-		default:
 		}
 	}
 }
@@ -330,13 +327,14 @@ func (rf *Raft) requestVotes() chan RequestVoteReply {
 //
 func (rf *Raft) runCandidate() {
 	rf.isLeader = false
-	rf.currentTerm += 1
 	rf.votedFor = rf.me
-	rf.log("runCandidate")
+
+	rf.currentTerm += 1
+	voteCount := 1
 	voteChan := rf.requestVotes()
+	rf.p("runCandidate")
 
 	timer := rf.getElectionTimer()
-	voteCount := 1
 	majority := len(rf.peers)/2 + 1
 	for {
 		// The new leader within five seconds
@@ -344,10 +342,11 @@ func (rf *Raft) runCandidate() {
 		// we choose the election timeout to be 800ms ~ 1s. 5 elections should be enough ?
 		select {
 		case <-timer.C:
-			rf.log("Election timeout")
+			rf.p("Election timeout")
 			voteCount = 0
 			timer = rf.getElectionTimer()
 			rf.currentTerm += 1
+			voteCount = 1
 			voteChan = rf.requestVotes()
 		case args := <-rf.appendEntriesArgsChan:
 			reply := rf.handleAppendEntries(args)
@@ -371,7 +370,7 @@ func (rf *Raft) runCandidate() {
 			}
 			if reply.VoteGranted && rf.currentTerm == reply.Term {
 				voteCount += 1
-				rf.log("receive vote from %d, %d votes in total", reply.Peer, voteCount)
+				rf.p("receive vote from %d, %d votes in total", reply.Peer, voteCount)
 			}
 			if voteCount >= majority {
 				go rf.runLeader()
@@ -397,7 +396,7 @@ func (rf *Raft) sendHeartBeats() chan AppendEntriesReply {
 	return replyChan
 }
 
-func (rf *Raft) log(format string, a ...interface{}) (n int, err error) {
+func (rf *Raft) p(format string, a ...interface{}) (n int, err error) {
 	if rf.debug > 0 {
 		state := "follower"
 		if rf.isLeader {
@@ -411,7 +410,7 @@ func (rf *Raft) log(format string, a ...interface{}) (n int, err error) {
 }
 func (rf *Raft) runLeader() {
 	rf.isLeader = true
-	rf.log("runLeader")
+	rf.p("runLeader")
 	replyChan := rf.sendHeartBeats()
 
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -440,7 +439,6 @@ func (rf *Raft) runLeader() {
 				go rf.runFollower()
 				return
 			}
-		default:
 		}
 	}
 }
