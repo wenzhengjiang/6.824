@@ -200,9 +200,10 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.p("receive appendEntries from %d", args.LeaderId)
+	rf.p("receive appendEntries %v from %d", args, args.LeaderId)
 	rf.appendEntriesArgsCh <- args
 	*reply = <-rf.appendEntriesReplyCh
+	rf.p("reply appendEntries %v to %d", reply, args.LeaderId)
 }
 
 func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs) AppendEntriesReply {
@@ -215,16 +216,24 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs) AppendEntriesReply 
 		success = false
 	} else { // Log replication
 		// Find first inconsistent log entry
-		index := args.PrevLogIndex + 1
+		logIndex := args.PrevLogIndex + 1
+		entryIndex := 0
 		for {
-			if index >= len(rf.log) || rf.log[index].Term != args.Entries[index-args.PrevLogIndex-1].Term {
+			if logIndex >= len(rf.log) {
 				break
 			}
-			index += 1
+			if entryIndex >= len(args.Entries) {
+				break
+			}
+			if rf.log[logIndex].Term != args.Entries[entryIndex].Term {
+				break
+			}
+			logIndex += 1
+			entryIndex += 1
 		}
 
-		if index-args.PrevLogIndex-1 < len(args.Entries) { // If there are entries to append
-			rf.log = append(rf.log[:index], args.Entries[index-args.PrevLogIndex-1:]...)
+		if entryIndex < len(args.Entries) { // If there are entries to append
+			rf.log = append(rf.log[:logIndex], args.Entries[entryIndex:]...)
 		}
 		if args.LeaderCommit < len(rf.log)-1 {
 			rf.commitIndex = args.LeaderCommit
@@ -307,9 +316,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if !rf.isLeader {
 		return 0, 0, false
 	}
-	rf.clientRequestCh <- command
-	index := <-rf.clientReplyCh
-
+	rf.p("Start")
+	entry := LogEntry{Command: command, Term: rf.currentTerm}
+	rf.log = append(rf.log, entry)
+	index := len(rf.log) - 1
+	rf.p("Start return %d", index)
 	return index, rf.log[index].Term, true
 }
 
@@ -462,6 +473,7 @@ func (rf *Raft) sendHeartBeats() {
 			LeaderId:     rf.me,
 			PrevLogIndex: len(rf.log) - 1,
 			PrevLogTerm:  rf.log[len(rf.log)-1].Term,
+			LeaderCommit: rf.commitIndex,
 		})
 	}
 }
@@ -495,8 +507,6 @@ func (rf *Raft) runLeader() {
 
 	for {
 		select {
-		case <-ticker.C:
-			rf.sendHeartBeats()
 		case args := <-rf.appendEntriesArgsCh:
 			reply := rf.handleAppendEntries(args)
 			rf.appendEntriesReplyCh <- reply
@@ -518,11 +528,8 @@ func (rf *Raft) runLeader() {
 				go rf.runFollower()
 				return
 			}
-		case command := <-rf.clientRequestCh:
-			entry := LogEntry{Command: command, Term: rf.currentTerm}
-			rf.log = append(rf.log, entry)
-			index := len(rf.log) - 1
-			rf.clientReplyCh <- index
+		case <-ticker.C:
+			rf.sendHeartBeats()
 		}
 	}
 }
@@ -534,6 +541,9 @@ func (rf *Raft) runLeader() {
 func (rf *Raft) replicater(server int) {
 	for {
 		lastIndex := len(rf.log) - 1
+		if rf.isLeader {
+			//	rf.p("Run replicater: %d, %v", lastIndex, rf.nextIndex)
+		}
 
 		if rf.isLeader && lastIndex >= rf.nextIndex[server] {
 			args := AppendEntriesArgs{
@@ -544,6 +554,7 @@ func (rf *Raft) replicater(server int) {
 				Entries:      rf.log[rf.nextIndex[server] : lastIndex+1],
 				LeaderCommit: rf.commitIndex,
 			}
+			rf.p("replicae %v to %d", args, server)
 			var reply AppendEntriesReply
 			rf.sendAppendEntries(server, &args, &reply)
 			if reply.Success {
@@ -551,10 +562,12 @@ func (rf *Raft) replicater(server int) {
 				rf.nextIndex[server] = lastIndex + 1
 				rf.matchIndex[server] = lastIndex
 				rf.mu.Unlock()
+				rf.p("Successfully replicae to %d", server)
 			} else if reply.Term <= rf.currentTerm {
 				rf.mu.Lock()
 				rf.nextIndex[server] -= 1
 				rf.mu.Unlock()
+				rf.p("Re-try replicae to %d", server)
 				continue
 			} else {
 				rf.replyCh <- reply
@@ -579,6 +592,7 @@ func (rf *Raft) commiter() {
 				}
 			}
 			if count >= majority && rf.log[N].Term == rf.currentTerm {
+				rf.p("commit %d", N)
 				rf.commitIndex = N
 				break
 			}
@@ -596,6 +610,7 @@ func (rf *Raft) applier(applyCh chan ApplyMsg) {
 	for {
 		index := rf.lastApplied + 1
 		if index <= rf.commitIndex {
+			rf.p("apply %d", index)
 			applyCh <- ApplyMsg{
 				Index:   index,
 				Command: rf.log[index].Command,
@@ -639,6 +654,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rand.Seed(time.Now().Unix())
 	go rf.runFollower()
 	go rf.applier(applyCh)
+	go rf.commiter()
+	for server := range rf.peers {
+		if server != me {
+			go rf.replicater(server)
+		}
+	}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
