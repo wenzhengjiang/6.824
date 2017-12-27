@@ -290,7 +290,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	rf.p("send requestVote to %d", server)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	if !ok {
-		rf.p("failed to send requestVote to %d", server)
+		//rf.p("failed to send requestVote to %d", server)
 	}
 	return ok
 }
@@ -299,7 +299,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	//rf.p("send appendEntries to %d", server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	if !ok {
-		rf.p("failed to send appendEntries to %d", server)
+		//rf.p("failed to send appendEntries to %d", server)
 	}
 	return ok
 }
@@ -357,7 +357,7 @@ func (rf *Raft) runFollower() {
 	for {
 		select {
 		case <-timer.C:
-			rf.p("Election timeout")
+			rf.p("follower Election timeout")
 			// Timeout then become candidate
 			go rf.runCandidate()
 			return
@@ -414,8 +414,8 @@ func (rf *Raft) runCandidate() {
 
 	rf.currentTerm += 1
 	voteCount := 1
-	voteCh := rf.requestVotes()
 	rf.p("runCandidate")
+	voteCh := rf.requestVotes()
 
 	timer := rf.getElectionTimer()
 	majority := len(rf.peers)/2 + 1
@@ -425,7 +425,7 @@ func (rf *Raft) runCandidate() {
 		// we choose the election timeout to be 800ms ~ 1s. 5 elections should be enough ?
 		select {
 		case <-timer.C:
-			rf.p("Election timeout")
+			rf.p("candidate Election timeout")
 			voteCount = 0
 			timer = rf.getElectionTimer()
 			rf.currentTerm += 1
@@ -436,6 +436,7 @@ func (rf *Raft) runCandidate() {
 			rf.appendEntriesReplyCh <- reply
 			if reply.Success || rf.votedFor != rf.me {
 				go rf.runFollower()
+				return
 			}
 		case args := <-rf.requestVoteArgsCh:
 			reply := rf.handleRequestVote(args)
