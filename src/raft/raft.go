@@ -434,7 +434,7 @@ func (rf *Raft) runCandidate() {
 		case args := <-rf.appendEntriesArgsCh:
 			reply := rf.handleAppendEntries(args)
 			rf.appendEntriesReplyCh <- reply
-			if reply.Success {
+			if reply.Success || rf.votedFor != rf.me {
 				go rf.runFollower()
 			}
 		case args := <-rf.requestVoteArgsCh:
@@ -515,7 +515,7 @@ func (rf *Raft) runLeader() {
 		case args := <-rf.appendEntriesArgsCh:
 			reply := rf.handleAppendEntries(args)
 			rf.appendEntriesReplyCh <- reply
-			if reply.Success {
+			if reply.Success || rf.votedFor != rf.me {
 				go rf.runFollower()
 				return
 			}
