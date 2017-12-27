@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"labrpc"
 	"log"
@@ -98,13 +100,13 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := gob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -113,10 +115,11 @@ func (rf *Raft) persist() {
 func (rf *Raft) readPersist(data []byte) {
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := gob.NewDecoder(r)
-	// d.Decode(&rf.xxx)
-	// d.Decode(&rf.yyy)
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+	d.Decode(&rf.currentTerm)
+	d.Decode(&rf.votedFor)
+	d.Decode(&rf.log)
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -177,6 +180,7 @@ func (rf *Raft) handleRequestVote(args *RequestVoteArgs) RequestVoteReply {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 	}
+	rf.persist()
 	return RequestVoteReply{VoteGranted: voteGranted, Term: rf.currentTerm, Peer: rf.me}
 }
 
@@ -255,6 +259,8 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs) AppendEntriesReply 
 		rf.currentTerm = args.Term
 		rf.votedFor = args.LeaderId
 	}
+
+	rf.persist()
 	return AppendEntriesReply{Term: rf.currentTerm, Success: success, PeerId: rf.me}
 }
 
@@ -324,6 +330,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.p("Start")
 	entry := LogEntry{Command: command, Term: rf.currentTerm}
 	rf.log = append(rf.log, entry)
+	rf.persist()
 	index := len(rf.log) - 1
 	rf.p("Start return %d", index)
 	return index, rf.log[index].Term, true
@@ -449,6 +456,7 @@ func (rf *Raft) runCandidate() {
 			if reply.Term > rf.currentTerm {
 				rf.currentTerm = reply.Term
 				rf.votedFor = reply.Peer
+				rf.persist()
 				go rf.runFollower()
 				return
 			}
@@ -532,6 +540,7 @@ func (rf *Raft) runLeader() {
 			if reply.Term > rf.currentTerm {
 				rf.currentTerm = reply.Term
 				rf.votedFor = reply.PeerId
+				rf.persist()
 				go rf.runFollower()
 				return
 			}
