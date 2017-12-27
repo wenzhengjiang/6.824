@@ -153,7 +153,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.requestVoteArgsCh <- args
 	rf.p("handling requestVote from %d", args.CandidateId)
 	*reply = <-rf.requestVoteReplyCh
-	rf.p("reply requestVote %d from %d", args.CandidateId)
+	rf.p("reply requestVote %v from %d", reply, args.CandidateId)
 }
 
 func (rf *Raft) handleRequestVote(args *RequestVoteArgs) RequestVoteReply {
@@ -172,6 +172,11 @@ func (rf *Raft) handleRequestVote(args *RequestVoteArgs) RequestVoteReply {
 		voteGranted = false
 	}
 
+	// Got request from a condidate with higher term but stale log
+	if !voteGranted && args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+	}
 	return RequestVoteReply{VoteGranted: voteGranted, Term: rf.currentTerm, Peer: rf.me}
 }
 
@@ -200,10 +205,10 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.p("receive appendEntries %v from %d", args, args.LeaderId)
+	//rf.p("receive appendEntries %v from %d", args, args.LeaderId)
 	rf.appendEntriesArgsCh <- args
 	*reply = <-rf.appendEntriesReplyCh
-	rf.p("reply appendEntries %v to %d", reply, args.LeaderId)
+	//rf.p("reply appendEntries %v to %d", reply, args.LeaderId)
 }
 
 func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs) AppendEntriesReply {
@@ -291,7 +296,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	rf.p("send appendEntries to %d", server)
+	//rf.p("send appendEntries to %d", server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	if !ok {
 		rf.p("failed to send appendEntries to %d", server)
@@ -517,11 +522,12 @@ func (rf *Raft) runLeader() {
 		case args := <-rf.requestVoteArgsCh:
 			reply := rf.handleRequestVote(args)
 			rf.requestVoteReplyCh <- reply
-			if reply.VoteGranted {
+			if reply.VoteGranted || rf.votedFor == -1 {
 				go rf.runFollower()
 				return
 			}
 		case reply := <-rf.replyCh:
+			rf.p("AppendEntires response %v", reply)
 			if reply.Term > rf.currentTerm {
 				rf.currentTerm = reply.Term
 				rf.votedFor = reply.PeerId
@@ -541,9 +547,6 @@ func (rf *Raft) runLeader() {
 func (rf *Raft) replicater(server int) {
 	for {
 		lastIndex := len(rf.log) - 1
-		if rf.isLeader {
-			//	rf.p("Run replicater: %d, %v", lastIndex, rf.nextIndex)
-		}
 
 		if rf.isLeader && lastIndex >= rf.nextIndex[server] {
 			args := AppendEntriesArgs{
@@ -554,20 +557,24 @@ func (rf *Raft) replicater(server int) {
 				Entries:      rf.log[rf.nextIndex[server] : lastIndex+1],
 				LeaderCommit: rf.commitIndex,
 			}
-			rf.p("replicae %v to %d", args, server)
+			rf.p("replicate %v to %d", args, server)
 			var reply AppendEntriesReply
-			rf.sendAppendEntries(server, &args, &reply)
+			ok := rf.sendAppendEntries(server, &args, &reply)
+			if !ok {
+				continue
+			}
 			if reply.Success {
 				rf.mu.Lock()
 				rf.nextIndex[server] = lastIndex + 1
 				rf.matchIndex[server] = lastIndex
+				rf.p("Successfully replicate to %d", server)
+				rf.commit()
 				rf.mu.Unlock()
-				rf.p("Successfully replicae to %d", server)
 			} else if reply.Term <= rf.currentTerm {
 				rf.mu.Lock()
 				rf.nextIndex[server] -= 1
 				rf.mu.Unlock()
-				rf.p("Re-try replicae to %d", server)
+				rf.p("Re-try replicate to %d", server)
 				continue
 			} else {
 				rf.replyCh <- reply
@@ -581,24 +588,20 @@ func (rf *Raft) replicater(server int) {
 // Commit logs replicated to majority nodes during current term
 // Write: commitIndex
 //
-func (rf *Raft) commiter() {
-	for {
-		majority := len(rf.peers)/2 + 1
-		for N := len(rf.log) - 1; N > rf.commitIndex; N -= 1 {
-			count := 0
-			for _, index := range rf.matchIndex {
-				if index >= N {
-					count += 1
-				}
-			}
-			if count >= majority && rf.log[N].Term == rf.currentTerm {
-				rf.p("commit %d", N)
-				rf.commitIndex = N
-				break
+func (rf *Raft) commit() {
+	majority := len(rf.peers)/2 + 1
+	for N := len(rf.log) - 1; N > rf.commitIndex; N -= 1 {
+		count := 1
+		for _, index := range rf.matchIndex {
+			if index >= N {
+				count += 1
 			}
 		}
-
-		time.Sleep(10 * time.Millisecond)
+		if count >= majority && rf.log[N].Term == rf.currentTerm {
+			rf.p("commit %d", N)
+			rf.commitIndex = N
+			break
+		}
 	}
 }
 
@@ -654,7 +657,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rand.Seed(time.Now().Unix())
 	go rf.runFollower()
 	go rf.applier(applyCh)
-	go rf.commiter()
 	for server := range rf.peers {
 		if server != me {
 			go rf.replicater(server)
