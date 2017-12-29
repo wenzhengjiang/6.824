@@ -81,14 +81,17 @@ type Raft struct {
 	isLeader bool
 	debug    int
 	replyCh  chan AppendEntriesReply
+	alive    chan bool
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
+	rf.mu.Lock()
 	var term int = rf.CurrentTerm
 	var isleader bool = rf.isLeader
+	rf.mu.Unlock()
 
 	return term, isleader
 }
@@ -364,6 +367,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	rf.debug = 0
+	close(rf.alive)
 }
 
 func (rf *Raft) getElectionTimer() *time.Timer {
@@ -404,7 +408,7 @@ func (rf *Raft) runFollower() {
 }
 
 func (rf *Raft) requestVotes() chan RequestVoteReply {
-	voteCh := make(chan RequestVoteReply)
+	voteCh := make(chan RequestVoteReply, len(rf.peers)-1)
 
 	for i := range rf.peers {
 		if i == rf.me {
@@ -501,7 +505,12 @@ func (rf *Raft) sendHeartBeats() {
 		go func(server int, args AppendEntriesArgs) {
 			var reply AppendEntriesReply
 			if rf.sendAppendEntries(server, &args, &reply) {
-				rf.replyCh <- reply
+				if reply.Term > rf.CurrentTerm {
+					select {
+					case rf.replyCh <- reply:
+					default:
+					}
+				}
 			}
 		}(i, AppendEntriesArgs{
 			Term:         rf.CurrentTerm,
@@ -539,6 +548,7 @@ func (rf *Raft) runLeader() {
 			rf.matchIndex[i] = 0
 		}
 	}
+	rf.replyCh = make(chan AppendEntriesReply, 1)
 	rf.mu.Unlock()
 	rf.sendHeartBeats()
 
@@ -579,6 +589,13 @@ func (rf *Raft) runLeader() {
 //
 func (rf *Raft) replicater(server int) {
 	for {
+		select {
+		case _, ok := <-rf.alive:
+			if !ok {
+				return
+			}
+		default:
+		}
 		rf.mu.Lock()
 		lastIndex := len(rf.Log) - 1
 		if !rf.isLeader || lastIndex < rf.nextIndex[server] {
@@ -625,8 +642,11 @@ func (rf *Raft) replicater(server int) {
 		} else {
 			rf.p("received reply %v from %d", reply, server)
 			rf.mu.Lock()
-			if rf.isLeader {
-				rf.replyCh <- reply
+			if rf.isLeader && reply.Term > rf.CurrentTerm {
+				select {
+				case rf.replyCh <- reply:
+				default:
+				}
 			}
 			rf.mu.Unlock()
 		}
@@ -661,7 +681,17 @@ func (rf *Raft) commit() {
 //
 func (rf *Raft) applier(applyCh chan ApplyMsg) {
 	for {
-		for index := rf.lastApplied + 1; index <= rf.commitIndex; index += 1 {
+		select {
+		case _, ok := <-rf.alive:
+			if !ok {
+				return
+			}
+		default:
+		}
+		rf.mu.Lock()
+		commitIndex := rf.commitIndex
+		rf.mu.Unlock()
+		for index := rf.lastApplied + 1; index <= commitIndex; index += 1 {
 			rf.p("apply %d", index)
 			applyCh <- ApplyMsg{
 				Index:   index,
@@ -701,6 +731,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		requestVoteReplyCh:   make(chan RequestVoteReply),
 		debug:                Debug,
 		replyCh:              make(chan AppendEntriesReply),
+		alive:                make(chan bool),
 	}
 
 	// Your initialization code here (2A, 2B, 2C).
