@@ -52,7 +52,7 @@ type LogEntry struct {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	mu        sync.RWMutex        // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -88,10 +88,10 @@ type Raft struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
-	rf.mu.Lock()
+	rf.mu.RLock()
 	var term int = rf.CurrentTerm
 	var isleader bool = rf.isLeader
-	rf.mu.Unlock()
+	rf.mu.RUnlock()
 
 	return term, isleader
 }
@@ -344,11 +344,12 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	if !rf.isLeader {
-		return 0, 0, false
-	}
 	rf.p("Start")
 	rf.mu.Lock()
+	if !rf.isLeader {
+		rf.mu.Unlock()
+		return 0, 0, false
+	}
 	rf.p("Enter lock")
 	entry := LogEntry{Command: command, Term: rf.CurrentTerm}
 	rf.Log = append(rf.Log, entry)
@@ -498,10 +499,12 @@ func (rf *Raft) runCandidate() {
 }
 
 func (rf *Raft) sendHeartBeats() {
+	rf.p("Send heartBeats")
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
+		rf.mu.RLock()
 		go func(server int, args AppendEntriesArgs) {
 			var reply AppendEntriesReply
 			if rf.sendAppendEntries(server, &args, &reply) {
@@ -519,6 +522,7 @@ func (rf *Raft) sendHeartBeats() {
 			PrevLogTerm:  rf.Log[len(rf.Log)-1].Term,
 			LeaderCommit: rf.commitIndex,
 		})
+		rf.mu.RUnlock()
 	}
 }
 
@@ -596,10 +600,10 @@ func (rf *Raft) replicater(server int) {
 			}
 		default:
 		}
-		rf.mu.Lock()
+		rf.mu.RLock()
 		lastIndex := len(rf.Log) - 1
 		if !rf.isLeader || lastIndex < rf.nextIndex[server] {
-			rf.mu.Unlock()
+			rf.mu.RUnlock()
 			time.Sleep(20 * time.Millisecond)
 			continue
 		}
@@ -613,7 +617,7 @@ func (rf *Raft) replicater(server int) {
 			LeaderCommit: rf.commitIndex,
 		}
 		rf.p("replicate %v to %d", args, server)
-		rf.mu.Unlock()
+		rf.mu.RUnlock()
 		var reply AppendEntriesReply
 		ok := rf.sendAppendEntries(server, &args, &reply)
 		if !ok {
@@ -688,14 +692,17 @@ func (rf *Raft) applier(applyCh chan ApplyMsg) {
 			}
 		default:
 		}
-		rf.mu.Lock()
+		rf.mu.RLock()
 		commitIndex := rf.commitIndex
-		rf.mu.Unlock()
+		rf.mu.RUnlock()
 		for index := rf.lastApplied + 1; index <= commitIndex; index += 1 {
 			rf.p("apply %d", index)
+			rf.mu.RLock()
+			command := rf.Log[index].Command
+			rf.mu.RUnlock()
 			applyCh <- ApplyMsg{
 				Index:   index,
-				Command: rf.Log[index].Command,
+				Command: command,
 			}
 			rf.lastApplied = index
 		}
