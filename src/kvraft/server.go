@@ -17,11 +17,10 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Op    string
+	Key   string
+	value string
 }
 
 type RaftKV struct {
@@ -33,15 +32,69 @@ type RaftKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	executions map[int]chan bool
+	data       map[string]string
 }
 
-
+func (kv *RaftKV) applyReceiver() {
+	for {
+		msg := <-kv.applyCh
+		kv.mu.Lock()
+		kv.executions[msg.Index] <- true
+		kv.mu.Unlock()
+	}
+}
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	index, _, isLeader := kv.rf.Start(Op{Op: "Get", Key: args.Key})
+	if !isLeader {
+		reply.WrongLeader = true
+		return
+	}
+	resultCh := make(chan bool)
+	kv.mu.Lock()
+	kv.executions[index] = resultCh
+	kv.mu.Unlock()
+
+	<-resultCh
+
+	kv.mu.Lock()
+	value, ok := kv.data[args.Key]
+	kv.mu.Unlock()
+	if !ok {
+		reply.Err = ErrNoKey
+	} else {
+		reply.Err = OK
+		reply.Value = value
+	}
 }
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	index, _, isLeader := kv.rf.Start(Op{args.Op, args.Key, args.Value})
+	if !isLeader {
+		reply.WrongLeader = true
+		return
+	}
+	resultCh := make(chan bool)
+	kv.mu.Lock()
+	_, ok := kv.executions[index]
+	if ok {
+		DPrintf("Duplicate Index !!!!!")
+	}
+	kv.executions[index] = resultCh
+	kv.mu.Unlock()
+
+	<-resultCh
+
+	kv.mu.Lock()
+	if args.Op == "Put" {
+		kv.data[args.Key] = args.Value
+	} else {
+		kv.data[args.Key] += args.Value
+	}
+	kv.mu.Unlock()
+	reply.Err = OK
 }
 
 //
@@ -81,6 +134,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.data = make(map[string]string)
+	kv.executions = make(map[int]chan bool)
+
+	go kv.applyReceiver()
 
 	// You may need initialization code here.
 
