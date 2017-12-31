@@ -53,10 +53,17 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	}
 	resultCh := make(chan bool)
 	kv.mu.Lock()
+	if ch, ok := kv.executions[index]; ok {
+		close(ch)
+	}
 	kv.executions[index] = resultCh
 	kv.mu.Unlock()
 
-	<-resultCh
+	if !<-resultCh {
+		// Log is overwritten
+		reply.Err = ErrFailed
+		return
+	}
 
 	kv.mu.Lock()
 	value, ok := kv.data[args.Key]
@@ -78,14 +85,17 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	resultCh := make(chan bool)
 	kv.mu.Lock()
-	_, ok := kv.executions[index]
-	if ok {
-		DPrintf("Duplicate Index !!!!!")
+	if ch, ok := kv.executions[index]; ok {
+		close(ch)
 	}
 	kv.executions[index] = resultCh
 	kv.mu.Unlock()
 
-	<-resultCh
+	if !<-resultCh {
+		// Log is overwritten
+		reply.Err = ErrFailed
+		return
+	}
 
 	kv.mu.Lock()
 	if args.Op == "Put" {
